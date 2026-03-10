@@ -1,11 +1,10 @@
 /**
  * Septic Tank Level Monitor
- * Board: LILYGO TTGO T-Display (ESP32 + ST7789 135x240 TFT)
+ * Board: M5Stack Atom S3 Lite (ESP32-S3, headless — no display)
  * Sensor: JSN-SR04T waterproof ultrasonic (Trigger/Echo)
  *
  * Features:
  *   - Ultrasonic distance measurement → tank level %
- *   - Beautiful TFT gauge on built-in display
  *   - Web GUI with SVG tank visualization
  *   - Scheduled measurements (1x, 2x, 4x daily or manual)
  *   - Demo mode with live continuous scanning
@@ -21,17 +20,15 @@
 #include <AsyncTCP.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <TFT_eSPI.h>
 #include <LittleFS.h>
 #include <time.h>
 
 /* ═══════════════════════════════════════════
- *  PIN DEFINITIONS — TTGO T-Display safe pins
+ *  PIN DEFINITIONS — M5Stack Atom S3 Lite (Grove port)
  * ═══════════════════════════════════════════ */
-static const uint8_t PIN_TRIG = 26;   ///< JSN-SR04T trigger pin
-static const uint8_t PIN_ECHO = 25;   ///< JSN-SR04T echo pin
-static const uint8_t PIN_BTN_TOP = 0; ///< Top button (BOOT)
-static const uint8_t PIN_BTN_BOT = 35;///< Bottom button
+static const uint8_t PIN_TRIG = 2;   ///< JSN-SR04T trigger pin (Grove white wire)
+static const uint8_t PIN_ECHO = 1;   ///< JSN-SR04T echo pin (Grove yellow wire)
+static const uint8_t PIN_BTN  = 41;  ///< Atom S3 Lite built-in button
 
 /* ═══════════════════════════════════════════
  *  CONSTANTS
@@ -44,6 +41,8 @@ static const int MAX_LOG_ENTRIES = 50;           ///< Circular log size
 static const char* NTP_SERVER = "pool.ntp.org";
 static const char* AP_SSID = "SepticMonitor";   ///< Fallback AP name
 static const char* AP_PASS = "septic1234";       ///< Fallback AP password
+static const char* DEFAULT_WIFI_SSID = "P42";           ///< Default WiFi SSID
+static const char* DEFAULT_WIFI_PASS = "Taonra0022";    ///< Default WiFi password
 
 /* ═══════════════════════════════════════════
  *  CONFIG STRUCT — persisted in NVS
@@ -66,14 +65,13 @@ static Config cfg = {
  *  LOG ENTRY
  * ═══════════════════════════════════════════ */
 struct LogEntry {
-    char timestamp[20]; ///< "HH:MM:SS" or "MM/DD HH:MM"
+    char timestamp[20]; ///< "HH:MM:SS" or "uptime Xs"
     char message[80];   ///< Log text
 };
 
 /* ═══════════════════════════════════════════
  *  GLOBAL STATE
  * ═══════════════════════════════════════════ */
-static TFT_eSPI tft = TFT_eSPI();
 static AsyncWebServer server(80);
 static AsyncEventSource events("/api/stream");
 static Preferences prefs;
@@ -111,17 +109,27 @@ void sendSSEUpdate();
 String getTimeStr();
 
 /* ═══════════════════════════════════════════
+ *  TFT STUB — Atom S3 Lite has no display
+ * ═══════════════════════════════════════════ */
+
+/**
+ * Empty stub replacing TFT display drawing.
+ * Atom S3 Lite is headless; UI is served via web.
+ */
+inline void drawTFT() {}
+
+/* ═══════════════════════════════════════════
  *  NVS CONFIG PERSISTENCE
  * ═══════════════════════════════════════════ */
 
 /**
  * Load configuration from NVS flash.
- * Falls back to defaults if no saved config exists.
+ * Falls back to compiled defaults if no saved config exists.
  */
 void loadConfig() {
     prefs.begin("septic", true);
-    strlcpy(cfg.wifi_ssid, prefs.getString("ssid", "").c_str(), sizeof(cfg.wifi_ssid));
-    strlcpy(cfg.wifi_pass, prefs.getString("pass", "").c_str(), sizeof(cfg.wifi_pass));
+    strlcpy(cfg.wifi_ssid, prefs.getString("ssid", DEFAULT_WIFI_SSID).c_str(), sizeof(cfg.wifi_ssid));
+    strlcpy(cfg.wifi_pass, prefs.getString("pass", DEFAULT_WIFI_PASS).c_str(), sizeof(cfg.wifi_pass));
     cfg.tank_depth_cm = prefs.getFloat("depth", 200.0f);
     cfg.sensor_offset_cm = prefs.getFloat("offset", 5.0f);
     cfg.num_readings = prefs.getInt("readings", 30);
@@ -299,127 +307,6 @@ void updateLevel(float distance_cm) {
 }
 
 /* ═══════════════════════════════════════════
- *  TFT DISPLAY — Tank gauge on 135x240 screen
- * ═══════════════════════════════════════════ */
-
-/**
- * Draw the tank level gauge on the TFT display.
- * Shows: fill bar, percentage, distance, status.
- */
-void drawTFT() {
-    tft.fillScreen(TFT_BLACK);
-
-    // Title
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setTextDatum(TC_DATUM);
-    tft.setTextFont(2);
-    tft.drawString("SEPTIC TANK", 67, 4);
-
-    // Tank outline
-    int tank_x = 20, tank_y = 30, tank_w = 95, tank_h = 160;
-    tft.drawRoundRect(tank_x, tank_y, tank_w, tank_h, 6, TFT_DARKGREY);
-    tft.drawRoundRect(tank_x + 1, tank_y + 1, tank_w - 2, tank_h - 2, 5, 0x4208);
-
-    // Lid
-    tft.fillRoundRect(tank_x - 4, tank_y - 4, tank_w + 8, 8, 3, TFT_DARKGREY);
-
-    // Fill bar
-    int fill_h = (int)((g_level_pct / 100.0f) * (tank_h - 6));
-    if (fill_h < 0) fill_h = 0;
-    if (fill_h > tank_h - 6) fill_h = tank_h - 6;
-
-    uint16_t fill_color;
-    if (g_level_pct > 80) fill_color = TFT_RED;
-    else if (g_level_pct > 60) fill_color = TFT_ORANGE;
-    else if (g_level_pct > 40) fill_color = TFT_YELLOW;
-    else fill_color = TFT_CYAN;
-
-    int fill_y = tank_y + 3 + (tank_h - 6) - fill_h;
-    if (fill_h > 0) {
-        tft.fillRoundRect(tank_x + 3, fill_y, tank_w - 6, fill_h, 3, fill_color);
-        // Wave line
-        for (int wx = tank_x + 3; wx < tank_x + tank_w - 3; wx += 2) {
-            int wy = fill_y + (int)(2.0f * sin((wx + millis() / 200.0f) * 0.15f));
-            tft.drawPixel(wx, wy, TFT_WHITE);
-        }
-    }
-
-    // Scale markers
-    for (int pct = 25; pct <= 75; pct += 25) {
-        int my = tank_y + 3 + (int)((1.0f - pct / 100.0f) * (tank_h - 6));
-        tft.drawLine(tank_x - 2, my, tank_x + 2, my, TFT_DARKGREY);
-    }
-
-    // Percentage (big, right side)
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(fill_color, TFT_BLACK);
-    tft.setTextFont(7);
-    // Format: show integer if >= 10, else one decimal
-    char pctBuf[8];
-    if (g_level_pct >= 10.0f) {
-        snprintf(pctBuf, sizeof(pctBuf), "%d", (int)g_level_pct);
-    } else {
-        snprintf(pctBuf, sizeof(pctBuf), "%.1f", g_level_pct);
-    }
-    tft.drawString(pctBuf, 132, 36);
-    tft.setTextFont(2);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("% FULL", 132, 88);
-
-    // Stats (right side, below percentage)
-    tft.setTextFont(1);
-    tft.setTextDatum(TR_DATUM);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-
-    char statBuf[24];
-    snprintf(statBuf, sizeof(statBuf), "%.0f cm", g_distance_cm);
-    tft.drawString("DIST:", 132, 108);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString(statBuf, 132, 120);
-
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    snprintf(statBuf, sizeof(statBuf), "%.0f cm", g_level_cm);
-    tft.drawString("LEVEL:", 132, 136);
-    tft.setTextColor(TFT_GREEN, TFT_BLACK);
-    tft.drawString(statBuf, 132, 148);
-
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    snprintf(statBuf, sizeof(statBuf), "%.0f cm", cfg.tank_depth_cm);
-    tft.drawString("DEPTH:", 132, 164);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString(statBuf, 132, 176);
-
-    // Status bar (bottom)
-    tft.setTextDatum(BL_DATUM);
-    tft.setTextFont(1);
-    if (g_demo_mode) {
-        tft.setTextColor(TFT_MAGENTA, TFT_BLACK);
-        tft.drawString("DEMO LIVE", 4, 236);
-    } else if (g_scanning) {
-        tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-        tft.drawString("SCANNING...", 4, 236);
-    } else {
-        tft.setTextColor(TFT_GREEN, TFT_BLACK);
-        tft.drawString("IDLE", 4, 236);
-    }
-
-    tft.setTextDatum(BR_DATUM);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    if (g_wifi_connected) {
-        tft.drawString(WiFi.localIP().toString().c_str(), 132, 236);
-    } else if (g_ap_mode) {
-        tft.drawString("AP:SepticMonitor", 132, 236);
-    } else {
-        tft.drawString("No WiFi", 132, 236);
-    }
-
-    // Last update time
-    tft.setTextDatum(BC_DATUM);
-    tft.setTextColor(0x4208, TFT_BLACK);
-    tft.drawString(g_last_update, 67, 226);
-}
-
-/* ═══════════════════════════════════════════
  *  WiFi SETUP
  * ═══════════════════════════════════════════ */
 
@@ -440,20 +327,14 @@ void setupWiFi() {
     WiFi.mode(WIFI_STA);
     WiFi.begin(cfg.wifi_ssid, cfg.wifi_pass);
 
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("Connecting WiFi...", 67, 100);
-    tft.setTextFont(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString(cfg.wifi_ssid, 67, 130);
+    Serial.printf("Connecting to WiFi '%s'...\n", cfg.wifi_ssid);
 
     unsigned long start = millis();
     while (WiFi.status() != WL_CONNECTED && (millis() - start) < 15000) {
         delay(500);
-        tft.drawString(".", 67, 150);
+        Serial.print(".");
     }
+    Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
         g_wifi_connected = true;
@@ -799,28 +680,16 @@ void handleSchedule() {
 
 void setup() {
     Serial.begin(115200);
-    log_i("Septic Tank Monitor starting...");
+    delay(500); // Allow USB CDC to initialize on ESP32-S3
+    log_i("Septic Tank Monitor starting (Atom S3 Lite)...");
 
     // Ultrasonic pins
     pinMode(PIN_TRIG, OUTPUT);
     pinMode(PIN_ECHO, INPUT);
     digitalWrite(PIN_TRIG, LOW);
 
-    // Buttons
-    pinMode(PIN_BTN_TOP, INPUT_PULLUP);
-    pinMode(PIN_BTN_BOT, INPUT_PULLUP);
-
-    // TFT init
-    tft.init();
-    tft.setRotation(1); // Landscape, USB on left
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextFont(2);
-    tft.drawString("SEPTIC MONITOR", 120, 50);
-    tft.setTextFont(1);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("v1.0 - JSN-SR04T", 120, 80);
+    // Button
+    pinMode(PIN_BTN, INPUT_PULLUP);
 
     // Load config
     loadConfig();
@@ -840,8 +709,8 @@ void setup() {
         addLog("Initial reading OK");
     }
 
-    // Draw initial display
-    drawTFT();
+    log_i("Setup complete. IP: %s",
+          g_wifi_connected ? WiFi.localIP().toString().c_str() : "AP mode");
 }
 
 /* ═══════════════════════════════════════════
@@ -860,13 +729,12 @@ void loop() {
         drawTFT();
     }
 
-    // Button handling: Top button = measure now, Bottom = toggle demo
-    static bool btn_top_prev = true, btn_bot_prev = true;
-    bool btn_top = digitalRead(PIN_BTN_TOP);
-    bool btn_bot = digitalRead(PIN_BTN_BOT);
+    // Single button handling: press = trigger measurement
+    static bool btn_prev = true;
+    bool btn = digitalRead(PIN_BTN);
 
-    if (!btn_top && btn_top_prev) {
-        // Top button pressed: single measurement
+    if (!btn && btn_prev) {
+        // Button pressed: single measurement
         addLog("Button: measure");
         float dist = measureDistanceAvg(cfg.num_readings, cfg.measure_duration_sec);
         if (dist > 0) {
@@ -875,17 +743,7 @@ void loop() {
         drawTFT();
     }
 
-    if (!btn_bot && btn_bot_prev) {
-        // Bottom button pressed: toggle demo
-        g_demo_mode = !g_demo_mode;
-        char buf[30];
-        snprintf(buf, sizeof(buf), "Demo: %s", g_demo_mode ? "ON" : "OFF");
-        addLog(buf);
-        drawTFT();
-    }
-
-    btn_top_prev = btn_top;
-    btn_bot_prev = btn_bot;
+    btn_prev = btn;
 
     // Demo mode: continuous scanning
     if (g_demo_mode) {
@@ -895,12 +753,6 @@ void loop() {
             if (dist > 0) {
                 updateLevel(dist);
                 sendSSEUpdate();
-            }
-            // Redraw TFT every 500ms in demo to avoid flicker
-            static unsigned long tft_last = 0;
-            if (millis() - tft_last > 500) {
-                tft_last = millis();
-                drawTFT();
             }
         }
     }

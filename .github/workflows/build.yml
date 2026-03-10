@@ -23,6 +23,6 @@ jobs:
         with:
           name: firmware
           path: |
-            .pio/build/ttgo-t-display/firmware.bin
-            .pio/build/ttgo-t-display/bootloader.bin
-            .pio/build/ttgo-t-display/partitions.bin
+            .pio/build/atoms3/firmware.bin
+            .pio/build/atoms3/bootloader.bin
+            .pio/build/atoms3/partitions.bin
